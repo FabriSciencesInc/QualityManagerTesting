@@ -1,183 +1,247 @@
+import json
 import numpy as np
-import pandas as pd
 from pathlib import Path
-from sklearn.metrics import f1_score
+from typing import Dict, List, Tuple
 from qualitymanager import QualityChecker
-from PIL import Image
-from PIL.ExifTags import TAGS
+from scipy import stats
 import cv2
 
-# Initialize checker
-checker = QualityChecker()
-folder_path = "iPhone_14_Pro_Max"
-folder = Path(folder_path)
-masks_folder = folder / "results"
-
-def get_brightness_from_exif(image_path):
-    try:
-        with Image.open(image_path) as img:
-            exif = img.getexif()
-            if exif is None:
-                return None
-                
-            for tag_id, value in exif.items():
-                tag = TAGS.get(tag_id, tag_id)
-                if tag == 'BrightnessValue':
-                    return float(value)
-            return None
-    except:
-        return None
-
-def load_mask(image_name, masks_folder):
-    mask_path = masks_folder / f"{image_name.rsplit('.', 1)[0]}_mask.png"
-    if not mask_path.exists():
-        print(f"Warning: No mask found for {image_name}")
-        return None
-    return cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-
-# Read labels
-labels = {}
-with open(folder / "classifications.txt", 'r') as f:
-    for line in f:
-        if ',' in line:
-            image_name, label = line.strip().split(',')
-            labels[image_name] = label.strip().lower()
-
-# Use a single case-insensitive glob pattern for HEIC files
-print("Collecting metrics from images...")
-image_metrics = []
-heic_files = list(set(folder.glob('*.[Hh][Ee][Ii][Cc]')))  # Use set to ensure uniqueness
-print(f"Found {len(heic_files)} HEIC files")
-
-for file_path in heic_files:
-    if file_path.name not in labels:
-        print(f"Warning: No label found for {file_path.name}")
-        continue
+class ThresholdAnalyzer:
+    def __init__(self, folder_path: str, brightness_range: Tuple[float, float]):
+        self.folder_path = Path(folder_path)
+        self.brightness_range = brightness_range
+        self.quality_checker = QualityChecker()
         
-    print(f"Processing {file_path.name}...")
-    
-    # Load mask first - if no mask, skip this image
-    mask = load_mask(file_path.name, masks_folder)
-    if mask is None:
-        continue
-    
-    # Load image and check quality
-    image = checker.read_heic_image(str(file_path))
-    results = checker.check_image_quality(image, mask)
-    
-    # Add brightness from EXIF
-    brightness = get_brightness_from_exif(file_path)
-    
-    # Store all metrics and label for this image
-    image_metrics.append({
-        'graininess': float(results['metrics']['graininess']),
-        'sharpness': float(results['metrics']['sharpness']),
-        'contrast': float(results['metrics']['contrast']),
-        'brightness': float(brightness if brightness is not None else 0),
-        'label': labels[file_path.name]
-    })
+        # Weights for different metrics (must sum to 1.0)
+        self.metric_weights = {
+            'contrast': 0.4,
+            'graininess': 0.3,
+            'sharpness': 0.3
+        }
+        
+        self.good_metrics = {
+            'contrast': [],
+            'graininess': [],
+            'sharpness': []
+        }
+        self.bad_metrics = {
+            'contrast': [],
+            'graininess': [],
+            'sharpness': []
+        }
 
-# Convert to DataFrame for analysis
-df = pd.DataFrame(image_metrics)
-good_imgs = df[df['label'] == 'good']
-
-# Calculate percentile ranges for good images
-grain_lower_min = good_imgs['graininess'].quantile(0.1)
-sharp_lower_min = good_imgs['sharpness'].quantile(0.1)
-contrast_lower_min = good_imgs['contrast'].quantile(0.1)
-brightness_lower_min = good_imgs['brightness'].quantile(0.1)
-
-grain_upper_max = good_imgs['graininess'].quantile(0.9)
-sharp_upper_max = good_imgs['sharpness'].quantile(0.9)
-contrast_upper_max = good_imgs['contrast'].quantile(0.9)
-brightness_upper_max = good_imgs['brightness'].quantile(0.9)
-
-# Create search ranges
-grain_lower = np.linspace(grain_lower_min, grain_upper_max/2, 10)
-grain_upper = np.linspace(grain_lower_min*2, grain_upper_max, 10)
-sharp_lower = np.linspace(sharp_lower_min, sharp_upper_max/2, 10)
-sharp_upper = np.linspace(sharp_lower_min*2, sharp_upper_max, 10)
-contrast_lower = np.linspace(contrast_lower_min, contrast_upper_max/2, 10)
-contrast_upper = np.linspace(contrast_lower_min*2, contrast_upper_max, 10)
-brightness_lower = np.linspace(brightness_lower_min, brightness_upper_max/2, 10)
-brightness_upper = np.linspace(brightness_lower_min*2, brightness_upper_max, 10)
-
-# Grid search for optimal thresholds
-print("Starting grid search for optimal thresholds...")
-best_score = 0
-best_thresholds = None
-total_iterations = (len(grain_lower) * len(grain_upper) * 
-                   len(sharp_lower) * len(sharp_upper) * 
-                   len(contrast_lower) * len(contrast_upper) *
-                   len(brightness_lower) * len(brightness_upper))
-current_iteration = 0
-
-for g_lower in grain_lower:
-    for g_upper in grain_upper:
-        if g_lower >= g_upper:
-            continue
+    def remove_outliers(self, data: np.ndarray, zscore_threshold: float = 2.5) -> np.ndarray:
+        """
+        Remove outliers using z-score method.
+        
+        Args:
+            data: Input array of values
+            zscore_threshold: Z-score threshold for outlier detection (default 2.5)
+        
+        Returns:
+            Cleaned array with outliers removed
+        """
+        if len(data) < 4:  # Need enough data for meaningful statistics
+            return data
             
-        for s_lower in sharp_lower:
-            for s_upper in sharp_upper:
-                if s_lower >= s_upper:
+        # Calculate z-scores
+        z_scores = np.abs(stats.zscore(data))
+        
+        # Keep only values within threshold
+        return data[z_scores < zscore_threshold]
+
+    def calculate_robust_statistics(self, data: np.ndarray) -> Tuple[float, float]:
+        """
+        Calculate robust mean and standard deviation using trimmed statistics.
+        
+        Args:
+            data: Input array of values
+        
+        Returns:
+            Tuple of (robust_mean, robust_std)
+        """
+        if len(data) < 4:
+            return np.mean(data), np.std(data)
+            
+        # Use trimmed mean (removing top and bottom 10%)
+        trimmed_mean = stats.trim_mean(data, 0.1)
+        
+        # Calculate MAD (Median Absolute Deviation) for robust std
+        mad = stats.median_abs_deviation(data)
+        robust_std = mad * 1.4826  # Scale factor to make MAD comparable to std
+        
+        return trimmed_mean, robust_std
+
+    def calculate_thresholds(self, percentile: float = 10, zscore_threshold: float = 2.5) -> Dict:
+        """
+        Calculate thresholds with outlier handling.
+        
+        Args:
+            percentile: Percentile to use for threshold calculation
+            zscore_threshold: Z-score threshold for outlier detection
+        """
+        self.collect_metrics()
+        thresholds = {}
+        
+        for metric in ['contrast', 'graininess', 'sharpness']:
+            # Convert to numpy arrays
+            good_values = np.array(self.good_metrics[metric])
+            bad_values = np.array(self.bad_metrics[metric])
+            
+            if len(good_values) == 0 or len(bad_values) == 0:
+                print(f"Warning: No data for {metric}")
+                continue
+            
+            # Remove outliers
+            good_values_clean = self.remove_outliers(good_values, zscore_threshold)
+            bad_values_clean = self.remove_outliers(bad_values, zscore_threshold)
+            
+            # Calculate robust statistics
+            good_mean, good_std = self.calculate_robust_statistics(good_values_clean)
+            bad_mean, bad_std = self.calculate_robust_statistics(bad_values_clean)
+            
+            # Calculate initial thresholds using cleaned data
+            lower_threshold = np.percentile(good_values_clean, percentile)
+            upper_threshold = np.percentile(good_values_clean, 100 - percentile)
+            
+            # Adjust thresholds based on bad image patterns
+            if bad_mean < good_mean:
+                # Bad images tend to have lower values
+                separation_point = (good_mean - good_std + bad_mean + bad_std) / 2
+                lower_threshold = max(lower_threshold, separation_point)
+            
+            if bad_mean > good_mean:
+                # Bad images tend to have higher values
+                separation_point = (good_mean + good_std + bad_mean - bad_std) / 2
+                upper_threshold = min(upper_threshold, separation_point)
+            
+            thresholds[metric] = {
+                'lower': float(lower_threshold),
+                'upper': float(upper_threshold)
+            }
+        
+        # Add static brightness thresholds
+        thresholds['brightness'] = {
+            'lower': self.brightness_range[0],
+            'upper': self.brightness_range[1]
+        }
+        
+        return thresholds
+
+    def print_threshold_analysis(self, thresholds: Dict):
+        """Print detailed analysis including outlier information."""
+        print("\nThreshold Analysis:")
+        print("-" * 50)
+        
+        for metric in thresholds:
+            print(f"\n{metric.capitalize()}:")
+            print(f"  Range: {thresholds[metric]['lower']:.2f} - {thresholds[metric]['upper']:.2f}")
+            
+            if metric != 'brightness':
+                good_values = np.array(self.good_metrics[metric])
+                bad_values = np.array(self.bad_metrics[metric])
+                
+                # Clean values
+                good_clean = self.remove_outliers(good_values)
+                bad_clean = self.remove_outliers(bad_values)
+                
+                # Calculate statistics
+                good_mean, good_std = self.calculate_robust_statistics(good_clean)
+                bad_mean, bad_std = self.calculate_robust_statistics(bad_clean)
+                
+                print(f"  Good images (after outlier removal):")
+                print(f"    Samples: {len(good_clean)} (removed {len(good_values) - len(good_clean)} outliers)")
+                print(f"    Robust Mean: {good_mean:.2f}")
+                print(f"    Robust Std:  {good_std:.2f}")
+                print(f"    Range: {np.min(good_clean):.2f} - {np.max(good_clean):.2f}")
+                
+                print(f"  Bad images (after outlier removal):")
+                print(f"    Samples: {len(bad_clean)} (removed {len(bad_values) - len(bad_clean)} outliers)")
+                print(f"    Robust Mean: {bad_mean:.2f}")
+                print(f"    Robust Std:  {bad_std:.2f}")
+                print(f"    Range: {np.min(bad_clean):.2f} - {np.max(bad_clean):.2f}")
+
+    def collect_metrics(self):
+        """Collect metrics for all classified images."""
+        try:
+            classifications = self.load_classifications()
+            
+            for image_name, classification in classifications.items():
+                if classification not in ['good', 'bad']:
                     continue
                     
-                for c_lower in contrast_lower:
-                    for c_upper in contrast_upper:
-                        if c_lower >= c_upper:
-                            continue
-                            
-                        for b_lower in brightness_lower:
-                            for b_upper in brightness_upper:
-                                current_iteration += 1
-                                if current_iteration % 1000 == 0:
-                                    print(f"Progress: {current_iteration}/{total_iterations} combinations tested")
-                                    
-                                if b_lower >= b_upper:
-                                    continue
-                                    
-                                # Test current thresholds
-                                predictions = []
-                                true_labels = []
-                                
-                                for metric in image_metrics:
-                                    passes = (
-                                        g_lower <= metric['graininess'] <= g_upper and
-                                        s_lower <= metric['sharpness'] <= s_upper and
-                                        c_lower <= metric['contrast'] <= c_upper and
-                                        b_lower <= metric['brightness'] <= b_upper
-                                    )
-                                    
-                                    predictions.append('good' if passes else 'bad')
-                                    true_labels.append(metric['label'])
-                                
-                                score = f1_score(true_labels, predictions, pos_label='good')
-                                
-                                if score > best_score:
-                                    best_score = score
-                                    best_thresholds = {
-                                        'grain': {'lower': g_lower, 'upper': g_upper},
-                                        'sharpness': {'lower': s_lower, 'upper': s_upper},
-                                        'contrast': {'lower': c_lower, 'upper': c_upper},
-                                        'brightness': {'lower': b_lower, 'upper': b_upper}
-                                    }
+                # Load image and its mask
+                image_path = self.folder_path / image_name
+                if not image_path.exists():
+                    print(f"Warning: Image {image_name} not found")
+                    continue
+                    
+                mask_path = self.folder_path / 'results' / f"{image_path.stem}_mask.png"
+                
+                try:
+                    # Read and process image
+                    image = self.quality_checker.read_heic_image(str(image_path))
+                    if mask_path.exists():
+                        mask = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                        mask = cv2.resize(mask, (image.shape[1], image.shape[0]), 
+                                    interpolation=cv2.INTER_NEAREST)
+                        mask = cv2.bitwise_not(mask)
+                    else:
+                        print(f"Warning: No mask found for {image_name}")
+                        mask = np.ones((image.shape[0], image.shape[1]), dtype=np.uint8) * 255
+                    
+                    # Get metrics
+                    results = self.quality_checker.check_image_quality(image, mask)
+                    
+                    # Store metrics based on classification
+                    metrics_dict = self.good_metrics if classification == 'good' else self.bad_metrics
+                    for metric in ['contrast', 'graininess', 'sharpness']:
+                        metrics_dict[metric].append(results['metrics'][metric])
+                        
+                except Exception as e:
+                    print(f"Error processing {image_name}: {e}")
+                    
+        except FileNotFoundError:
+            print("No classifications.json file found. Please classify some images first.")
+            raise
 
-# Print and save results
-print(f"\nOptimization complete!")
-print(f"Best F1 score: {best_score:.3f}")
-print("\nOptimal thresholds:")
-print(f"Graininess range: {best_thresholds['grain']['lower']:.2f} - {best_thresholds['grain']['upper']:.2f}")
-print(f"Sharpness range: {best_thresholds['sharpness']['lower']:.2f} - {best_thresholds['sharpness']['upper']:.2f}")
-print(f"Contrast range: {best_thresholds['contrast']['lower']:.2f} - {best_thresholds['contrast']['upper']:.2f}")
-print(f"Brightness range: {best_thresholds['brightness']['lower']:.2f} - {best_thresholds['brightness']['upper']:.2f}")
+    def load_classifications(self) -> Dict:
+        """Load the classifications from JSON file."""
+        classification_file = self.folder_path / 'classifications.json'
+        if not classification_file.exists():
+            raise FileNotFoundError(f"No classifications file found at {classification_file}")
+                
+        with open(classification_file, 'r') as f:
+            return json.load(f)
 
-# Save thresholds to file
-with open('optimal_thresholds.txt', 'w') as f:
-    f.write(f"Graininess lower: {best_thresholds['grain']['lower']:.2f}\n")
-    f.write(f"Graininess upper: {best_thresholds['grain']['upper']:.2f}\n")
-    f.write(f"Sharpness lower: {best_thresholds['sharpness']['lower']:.2f}\n")
-    f.write(f"Sharpness upper: {best_thresholds['sharpness']['upper']:.2f}\n")
-    f.write(f"Contrast lower: {best_thresholds['contrast']['lower']:.2f}\n")
-    f.write(f"Contrast upper: {best_thresholds['contrast']['upper']:.2f}\n")
-    f.write(f"Brightness lower: {best_thresholds['brightness']['lower']:.2f}\n")
-    f.write(f"Brightness upper: {best_thresholds['brightness']['upper']:.2f}\n")
+    def save_thresholds(self, thresholds: Dict, output_file: str = None):
+        """Save calculated thresholds to a JSON file."""
+        if output_file is None:
+            output_file = self.folder_path / 'quality_thresholds.json'
+                
+        with open(output_file, 'w') as f:
+            json.dump({
+                'thresholds': thresholds,
+                'weights': self.metric_weights,
+                'metadata': {
+                    'good_samples': {k: len(v) for k, v in self.good_metrics.items()},
+                    'bad_samples': {k: len(v) for k, v in self.bad_metrics.items()}
+                }
+            }, f, indent=4)
+
+def main():
+    # Example usage
+    folder_path = "/Users/amoghpanhale/Documents/GitHub/QualityManagerTesting/iPhone 12 Pro - Batch 2/batch_1"
+    brightness_range = (-2.0, 10.0)  # Adjust these values as needed
+    
+    analyzer = ThresholdAnalyzer(folder_path, brightness_range)
+    thresholds = analyzer.calculate_thresholds(percentile=5)
+    
+    # Save thresholds
+    analyzer.save_thresholds(thresholds)
+    
+    # Print analysis
+    analyzer.print_threshold_analysis(thresholds)
+
+if __name__ == "__main__":
+    main()
