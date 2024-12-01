@@ -1,0 +1,42 @@
+{
+    "thresholds": {
+        "contrast": {
+            "lower": 65.63000392871174,
+            "upper": 87.56862745098039
+        },
+        "graininess": {
+            "lower": 7313.161345368814,
+            "upper": 15068.540039062498
+        },
+        "sharpness": {
+            "lower": 19785.942328568362,
+            "upper": 48258.997656249994
+        },
+        "brightness": {
+            "lower": -2.0,
+            "upper": 10.0
+        }
+    },
+    "weights": {
+        "contrast": 0.4,
+        "graininess": 0.3,
+        "sharpness": 0.3
+    },
+    "metadata": {
+        "source_folders": [
+            "/Users/amoghpanhale/Documents/GitHub/QualityManagerTesting/iPhone 12 Pro - Batch 2/batch_1",
+            "/Users/amoghpanhale/Documents/GitHub/QualityManagerTesting/iPhone 12 Pro - Batch 2/batch_2"
+        ],
+        "total_images_processed": 100,
+        "good_samples": {
+            "contrast": 78,
+            "graininess": 78,
+            "sharpness": 78
+        },
+        "bad_samples": {
+            "contrast": 22,
+            "graininess": 22,
+            "sharpness": 22
+        }
+    }
+}
